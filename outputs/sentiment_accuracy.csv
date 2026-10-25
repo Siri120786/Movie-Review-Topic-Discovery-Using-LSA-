@@ -1,0 +1,6 @@
+method,type,accuracy,lower_95,upper_95
+AFINN,Lexicon (no training),0.7001,0.6910118292592602,0.7090715040696923
+Bing,Lexicon (no training),0.7336,0.7248182616576778,0.742245503534593
+NRC,Lexicon (no training),0.6518,0.6423695781459225,0.6611419407324728
+AFINN + negation,Lexicon (no training),0.7137,0.7047290030327046,0.7225463885066993
+Logistic regression (test set),Supervised,0.848,0.8315068327845154,0.8634656438883146

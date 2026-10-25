@@ -1,0 +1,23 @@
+# Large or regenerable data (rebuild with prepare_data.R)
+data/
+
+# Sentiment lexicons (licensed separately; download with get_lexicons.R)
+lexicons/
+
+# Trained model (rebuild with train_model.R; it embeds the lexicons)
+model/
+
+# R / RStudio session files
+.RData
+.Rhistory
+.Rproj.user/
+rsconnect/
+
+# Knitting intermediates
+*_cache/
+movie_review_lsa_files/
+
+# OS and tool files
+desktop.ini
+Thumbs.db
+.DS_Store

@@ -1,0 +1,838 @@
+---
+title: "Movie Review Topic Discovery Using LSA"
+subtitle: "Sentiment analysis in R on the IMDb Large Movie Review Dataset"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: show
+    theme: flatly
+    df_print: kable
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 9, fig.height = 5, dpi = 110,
+  fig.path = "outputs/figures/"
+)
+```
+
+This notebook implements the six-stage pipeline proposed in the project
+report: **clean → tokenize & tf-idf → document-term matrix → LSA topics →
+lexicon sentiment → validation**. Every number and chart below is produced by
+running the code on the data.
+
+# Setup
+
+```{r packages}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(forcats)
+library(ggplot2)
+library(scales)
+library(tidytext)
+library(Matrix)
+library(irlba)        # fast truncated SVD on a sparse matrix
+library(wordcloud)
+library(RColorBrewer)
+library(reshape2)
+library(caret)        # confusion matrices
+library(glmnet)       # regularised logistic regression
+library(lime)         # local explanations of the classifier
+
+set.seed(2026)
+theme_set(theme_minimal(base_size = 12))
+dir.create("outputs", showWarnings = FALSE)
+
+N_PER_CLASS <- 5000   # reviews sampled per class (report: 5k-10k total is enough)
+K_TOPICS    <- 10     # number of LSA topics kept (justified by the scree plot)
+```
+
+Sentiment lexicons. Bing ships with **tidytext**; AFINN and NRC are fetched
+once with **textdata** by `get_lexicons.R` and cached in `lexicons/`.
+
+```{r lexicons}
+afinn <- readRDS("lexicons/afinn/afinn.rds")
+bing  <- get_sentiments("bing")
+nrc   <- readRDS("lexicons/nrc/nrc.rds")
+
+tibble(lexicon = c("AFINN", "Bing", "NRC"),
+       words   = c(nrow(afinn), nrow(bing), n_distinct(nrc$word)),
+       scoring = c("integer -5 .. +5", "positive / negative",
+                   "positive / negative + 8 emotions"))
+```
+
+# Stage 1 – Explore and clean the text
+
+```{r load}
+reviews_all <- read_csv("data/imdb_reviews.csv", show_col_types = FALSE)
+
+reviews <- reviews_all |>
+  group_by(sentiment) |>
+  slice_sample(n = N_PER_CLASS) |>
+  ungroup() |>
+  mutate(id = row_number())
+
+cat("Full dataset:", nrow(reviews_all), "reviews | analysed sample:",
+    nrow(reviews), "reviews\n")
+count(reviews_all, sentiment, name = "reviews_in_full_dataset")
+```
+
+```{r clean}
+clean_text <- function(x) {
+  x |>
+    str_replace_all("<[^>]+>", " ") |>      # HTML tags such as <br />
+    str_to_lower() |>
+    str_replace_all("[^a-z' ]", " ") |>      # punctuation and numbers
+    str_replace_all("(^| )'+|'+( |$)", " ") |>
+    str_squish()
+}
+
+reviews <- reviews |>
+  mutate(clean   = clean_text(review),
+         n_words = str_count(clean, "\\S+"))
+
+reviews |> select(review) |> slice(1) |> pull() |> str_trunc(400) |> cat()
+cat("\n\n--- after cleaning ---\n\n")
+reviews |> select(clean)  |> slice(1) |> pull() |> str_trunc(400) |> cat()
+```
+
+```{r eda-summary}
+reviews |>
+  group_by(sentiment) |>
+  summarise(reviews       = n(),
+            mean_words    = round(mean(n_words)),
+            median_words  = median(n_words),
+            min_words     = min(n_words),
+            max_words     = max(n_words),
+            mean_stars    = round(mean(rating), 2))
+```
+
+```{r eda-plots, fig.height = 4.5}
+ggplot(reviews, aes(n_words, fill = sentiment)) +
+  geom_histogram(bins = 60, alpha = 0.75, position = "identity") +
+  scale_x_continuous(limits = c(0, 1200)) +
+  scale_fill_manual(values = c(negative = "#d1495b", positive = "#00798c")) +
+  labs(title = "Review length by sentiment",
+       subtitle = "Both classes have a similar long-tailed length distribution",
+       x = "Words per review (after cleaning)", y = "Reviews", fill = NULL)
+
+reviews |>
+  count(rating, sentiment) |>
+  ggplot(aes(factor(rating), n, fill = sentiment)) +
+  geom_col() +
+  scale_fill_manual(values = c(negative = "#d1495b", positive = "#00798c")) +
+  labs(title = "Star ratings in the sample",
+       subtitle = "Labels come from ratings: <= 4 stars negative, >= 7 positive (neutral 5-6 excluded)",
+       x = "Stars", y = "Reviews", fill = NULL)
+```
+
+# Stage 2 – Tokenize, word frequency and tf-idf
+
+`unnest_tokens()` gives one word per row. Two token tables are kept:
+`tokens_all` (every word, used for sentiment so that words such as *not* stay
+available) and `tokens` (stop words removed, used for frequency, tf-idf and LSA).
+
+```{r tokenize}
+tokens_all <- reviews |>
+  select(id, sentiment, clean) |>
+  unnest_tokens(word, clean) |>
+  group_by(id) |>
+  mutate(position = row_number()) |>
+  ungroup()
+
+# Domain words that appear everywhere and carry no topic information
+domain_stop <- tibble(word = c("movie", "movies", "film", "films", "br",
+                               "time", "watch", "watching", "watched",
+                               "people", "lot", "makes", "bit", "thing"))
+
+tokens <- tokens_all |>
+  anti_join(stop_words, by = "word") |>
+  filter(str_length(word) > 2)
+
+cat("Tokens (all words):", format(nrow(tokens_all), big.mark = ","),
+    "\nTokens (stop words removed):", format(nrow(tokens), big.mark = ","),
+    "\nDistinct words:", format(n_distinct(tokens$word), big.mark = ","), "\n")
+```
+
+```{r word-freq, fig.height = 5.5}
+word_counts <- tokens |> count(word, sort = TRUE)
+
+word_counts |>
+  slice_head(n = 25) |>
+  ggplot(aes(n, fct_reorder(word, n))) +
+  geom_col(fill = "#30638e") +
+  labs(title = "Most frequent words (stop words removed)",
+       x = "Occurrences", y = NULL)
+```
+
+**Zipf's law.** A handful of words dominate raw counts – frequency falls
+roughly in proportion to 1 / rank – which is why raw counts alone are a poor
+measure of how informative a word is.
+
+```{r zipf, fig.height = 4.5}
+zipf <- tokens_all |>
+  count(word, sort = TRUE) |>
+  mutate(rank = row_number(), freq = n / sum(n))
+
+zipf_fit <- lm(log10(freq) ~ log10(rank), data = filter(zipf, rank <= 5000))
+
+ggplot(zipf, aes(rank, freq)) +
+  geom_line(colour = "#30638e", linewidth = 1) +
+  geom_abline(intercept = coef(zipf_fit)[1], slope = coef(zipf_fit)[2],
+              linetype = "dashed", colour = "grey40") +
+  scale_x_log10(labels = comma) + scale_y_log10() +
+  labs(title = "Zipf's law in IMDb reviews",
+       subtitle = sprintf("Fitted log-log slope = %.2f (Zipf's law predicts about -1)",
+                          coef(zipf_fit)[2]),
+       x = "Word rank (log scale)", y = "Term frequency (log scale)")
+```
+
+**tf-idf.** `bind_tf_idf()` weights each word in each review by how often it
+appears there (*tf*) and how rare it is across all reviews (*idf*). Words
+that are distinctive for a few reviews score high; words found everywhere
+score close to zero.
+
+```{r tfidf}
+review_tfidf <- tokens |>
+  count(id, word) |>
+  bind_tf_idf(word, id, n)
+
+# Words that are both reasonably common and distinctive where they occur
+review_tfidf |>
+  group_by(word) |>
+  summarise(reviews = n(), idf = first(idf), mean_tf_idf = mean(tf_idf)) |>
+  filter(reviews >= 50) |>
+  arrange(desc(mean_tf_idf)) |>
+  slice_head(n = 15) |>
+  mutate(across(c(idf, mean_tf_idf), \(x) round(x, 3)))
+```
+
+Distinctive vocabulary of each star rating (each rating group treated as one
+"document"):
+
+```{r tfidf-rating, fig.height = 7}
+tokens |>
+  left_join(select(reviews, id, rating), by = "id") |>
+  count(rating, word) |>
+  filter(n >= 15) |>
+  bind_tf_idf(word, rating, n) |>
+  group_by(rating) |>
+  slice_max(tf_idf, n = 6, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(rating = paste(rating, "stars"),
+         word   = reorder_within(word, tf_idf, rating)) |>
+  ggplot(aes(tf_idf, word, fill = rating)) +
+  geom_col(show.legend = FALSE) +
+  scale_y_reordered() +
+  facet_wrap(~ rating, scales = "free_y", ncol = 4) +
+  labs(title = "Highest tf-idf words for each star rating",
+       x = "tf-idf", y = NULL)
+```
+
+# Stage 3 – Document-term matrix
+
+Rows are reviews, columns are terms, values are tf-idf weights. Very rare
+terms (in fewer than 20 reviews) and near-universal ones (more than 30 % of
+reviews) are dropped, and each row is scaled to unit length so that long
+reviews do not dominate the decomposition.
+
+```{r dtm}
+doc_freq <- tokens |>
+  anti_join(domain_stop, by = "word") |>
+  distinct(id, word) |>
+  count(word, name = "df")
+
+vocab <- doc_freq |>
+  filter(df >= 20, df <= 0.30 * nrow(reviews)) |>
+  pull(word) |>
+  sort()
+
+idf_lookup <- review_tfidf |>
+  filter(word %in% vocab) |>
+  distinct(word, idf)
+idf_vec <- setNames(idf_lookup$idf, idf_lookup$word)[vocab]
+
+# Turns any character vector of reviews into an L2-normalised tf-idf matrix
+# over the fixed vocabulary (re-used later by the classifier and LIME).
+text_to_dtm <- function(texts) {
+  td <- tibble(doc = seq_along(texts), text = clean_text(texts)) |>
+    unnest_tokens(word, text) |>
+    filter(word %in% vocab) |>
+    count(doc, word) |>
+    group_by(doc) |>
+    mutate(w = n / sum(n) * idf_vec[word]) |>
+    ungroup()
+  m <- sparseMatrix(i = td$doc, j = match(td$word, vocab), x = td$w,
+                    dims = c(length(texts), length(vocab)),
+                    dimnames = list(NULL, vocab))
+  norms <- sqrt(rowSums(m^2))
+  norms[norms == 0] <- 1
+  Diagonal(x = 1 / norms) %*% m
+}
+
+dtm <- text_to_dtm(reviews$review)
+
+cat(sprintf("Document-term matrix: %s reviews x %s terms, %.2f%% non-zero\n",
+            comma(nrow(dtm)), comma(ncol(dtm)),
+            100 * length(dtm@x) / prod(dim(dtm))))
+```
+
+# Stage 4 – Topic discovery with LSA
+
+LSA factorises the matrix with a truncated SVD: **A ≈ U~k~ Σ~k~ V~k~^T^**.
+`irlba` computes the leading 50 singular vectors directly on the sparse
+matrix, which is far cheaper than a full dense SVD.
+
+```{r svd}
+svd50 <- irlba(dtm, nv = 50, nu = 50)
+
+total_var <- sum(dtm^2)                      # squared Frobenius norm
+scree <- tibble(dimension = 1:50,
+                var_explained = svd50$d^2 / total_var) |>
+  mutate(cumulative = cumsum(var_explained))
+```
+
+```{r scree, fig.height = 4.5}
+ggplot(scree, aes(dimension, var_explained)) +
+  geom_line(colour = "#30638e") +
+  geom_point(colour = "#30638e") +
+  geom_vline(xintercept = K_TOPICS, linetype = "dashed", colour = "#d1495b") +
+  annotate("text", x = K_TOPICS + 0.5, y = max(scree$var_explained),
+           label = paste("k =", K_TOPICS), hjust = 0, colour = "#d1495b") +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(title = "Scree plot of the LSA dimensions",
+       subtitle = "Variance explained flattens after roughly the first ten dimensions",
+       x = "LSA dimension", y = "Share of total variance")
+
+scree |> filter(dimension %in% c(1, 5, 10, 20, 50)) |>
+  mutate(across(-dimension, \(x) percent(x, accuracy = 0.01)))
+```
+
+Text matrices have a very flat spectrum, so k cannot be chosen from a
+variance target such as 80 %: the scree plot's elbow is used instead, and
+**k = `r K_TOPICS`** is kept.
+
+**Raw LSA dimensions.** Loadings can be positive *or* negative, and the first
+dimension simply captures the vocabulary shared by all reviews. This is the
+interpretability problem the report mentions:
+
+```{r raw-dims}
+raw_v <- svd50$v[, 1:4]
+rownames(raw_v) <- vocab
+lapply(1:4, function(j) {
+  tibble(dimension = j,
+         `top positive terms` = paste(names(sort(raw_v[, j], decreasing = TRUE))[1:8], collapse = ", "),
+         `top negative terms` = paste(names(sort(raw_v[, j]))[1:8], collapse = ", "))
+}) |> bind_rows()
+```
+
+**Rotated topics.** To make the k dimensions readable, the term loadings are
+rotated with **varimax** (a standard step in LSA and factor analysis). The
+rotation spans exactly the same k-dimensional space, but concentrates each
+topic on a smaller set of words. Each topic is oriented so its strongest
+words load positively.
+
+```{r rotate}
+V <- svd50$v[, 1:K_TOPICS]
+rot <- varimax(V, normalize = FALSE)
+loadings <- unclass(rot$loadings)
+rownames(loadings) <- vocab
+
+orientation <- apply(loadings, 2, function(col) sign(col[which.max(abs(col))]))
+loadings <- sweep(loadings, 2, orientation, `*`)
+colnames(loadings) <- paste0("T", 1:K_TOPICS)
+
+topic_terms <- as_tibble(loadings, rownames = "term") |>
+  pivot_longer(-term, names_to = "topic", values_to = "loading") |>
+  group_by(topic) |>
+  slice_max(loading, n = 12, with_ties = FALSE) |>
+  ungroup()
+
+topic_terms |>
+  group_by(topic) |>
+  summarise(top_terms = paste(term, collapse = ", ")) |>
+  arrange(as.integer(str_remove(topic, "T")))
+```
+
+Each topic is named from its highest-loading terms:
+
+```{r labels}
+topic_labels <- c(
+  T1  = "Acting & performances",
+  T2  = "Bad acting & wasted money",
+  T3  = "TV series & episodes",
+  T4  = "Horror & slashers",
+  T5  = "Comedy & humour",
+  T6  = "Book adaptations",
+  T7  = "Family & thriller plots",
+  T8  = "Music, love & family viewing",
+  T9  = "Action & special effects",
+  T10 = "War, history & documentaries"
+)
+topic_labels
+```
+
+```{r topic-terms-plot, fig.height = 11}
+topic_terms |>
+  group_by(topic) |>
+  slice_max(loading, n = 10, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(label = factor(topic_labels[topic], levels = topic_labels),
+         term  = reorder_within(term, loading, label)) |>
+  ggplot(aes(loading, term, fill = label)) +
+  geom_col(show.legend = FALSE) +
+  scale_y_reordered() +
+  facet_wrap(~ label, scales = "free_y", ncol = 2) +
+  labs(title = "Top terms for each LSA topic (varimax-rotated loadings)",
+       x = "Term loading", y = NULL)
+```
+
+Every review gets a score on each topic (its projection onto the rotated
+loadings) and is assigned to the topic it scores highest on.
+
+```{r assign}
+doc_scores <- as.matrix(dtm %*% loadings)
+
+reviews <- reviews |>
+  mutate(topic       = colnames(doc_scores)[max.col(doc_scores, ties.method = "first")],
+         topic_label = factor(topic_labels[topic], levels = topic_labels),
+         topic_score = apply(doc_scores, 1, max))
+
+reviews |>
+  count(topic_label) |>
+  ggplot(aes(n, fct_rev(topic_label))) +
+  geom_col(fill = "#30638e") +
+  geom_text(aes(label = comma(n)), hjust = -0.15, size = 3.5) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Reviews assigned to each topic (dominant topic)",
+       x = "Reviews", y = NULL)
+```
+
+Example review snippets for each topic (the review scoring highest on it):
+
+```{r examples}
+reviews |>
+  group_by(topic_label) |>
+  slice_max(topic_score, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  transmute(topic = topic_label, sentiment,
+            snippet = str_trunc(str_squish(str_replace_all(review, "<[^>]+>", " ")), 180))
+```
+
+# Stage 5 – Sentiment analysis with three dictionaries
+
+Each review is scored with every lexicon using **all** of its words
+(stop-word lists contain words like *not* and *well* that matter for opinion).
+
+* **AFINN** – sum of word scores (-5 … +5)
+* **Bing** – positive words minus negative words
+* **NRC** – positive minus negative words, plus counts for 8 emotions
+
+```{r score}
+words_only <- select(tokens_all, id, word)
+
+afinn_scores <- words_only |>
+  inner_join(afinn, by = "word") |>
+  group_by(id) |>
+  summarise(afinn = sum(value), afinn_words = n())
+
+bing_scores <- words_only |>
+  inner_join(bing, by = "word") |>
+  count(id, sentiment) |>
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) |>
+  transmute(id, bing = positive - negative, bing_words = positive + negative)
+
+nrc_polarity <- words_only |>
+  inner_join(filter(nrc, sentiment %in% c("positive", "negative")),
+             by = "word", relationship = "many-to-many") |>
+  count(id, sentiment) |>
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) |>
+  transmute(id, nrc = positive - negative)
+
+nrc_emotions <- words_only |>
+  inner_join(filter(nrc, !sentiment %in% c("positive", "negative")),
+             by = "word", relationship = "many-to-many") |>
+  count(id, sentiment) |>
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0)
+
+scored <- reviews |>
+  select(id, sentiment, rating, n_words, topic, topic_label) |>
+  left_join(afinn_scores, by = "id") |>
+  left_join(bing_scores,  by = "id") |>
+  left_join(nrc_polarity, by = "id") |>
+  mutate(across(c(afinn, afinn_words, bing, bing_words, nrc), \(x) coalesce(x, 0)))
+
+scored |>
+  group_by(sentiment) |>
+  summarise(across(c(afinn, bing, nrc), \(x) round(mean(x), 2), .names = "mean_{.col}"))
+```
+
+```{r top-sentiment-words, fig.height = 5}
+words_only |>
+  inner_join(bing, by = "word") |>
+  count(word, sentiment, sort = TRUE) |>
+  group_by(sentiment) |>
+  slice_max(n, n = 15, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(word = reorder_within(word, n, sentiment)) |>
+  ggplot(aes(n, word, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  scale_y_reordered() +
+  scale_fill_manual(values = c(negative = "#d1495b", positive = "#00798c")) +
+  facet_wrap(~ sentiment, scales = "free") +
+  labs(title = "Most common positive and negative words (Bing lexicon)",
+       x = "Occurrences", y = NULL)
+```
+
+Note *plot*, *funny* and *like*: lexicon words whose meaning in a movie
+review is not always opinion (see Limitations).
+
+```{r wordcloud-all, fig.width = 7, fig.height = 7}
+par(mar = rep(0, 4))
+word_counts |>
+  anti_join(domain_stop, by = "word") |>
+  with(wordcloud(word, n, max.words = 120, random.order = FALSE,
+                 rot.per = 0.15, colors = brewer.pal(8, "Dark2")))
+```
+
+```{r wordcloud-compare, fig.width = 7, fig.height = 7}
+par(mar = rep(0, 4))
+words_only |>
+  inner_join(bing, by = "word") |>
+  count(word, sentiment, sort = TRUE) |>
+  acast(word ~ sentiment, value.var = "n", fill = 0) |>
+  comparison.cloud(colors = c("#d1495b", "#00798c"), max.words = 150,
+                   title.size = 1.6)
+```
+
+**NRC emotions.** Share of emotion words falling into each emotion, by the
+true review label:
+
+```{r nrc-emotions, fig.height = 4.5}
+tokens_all |>
+  rename(review_label = sentiment) |>
+  inner_join(filter(nrc, !sentiment %in% c("positive", "negative")),
+             by = "word", relationship = "many-to-many") |>
+  count(review_label, emotion = sentiment) |>
+  group_by(review_label) |>
+  mutate(share = n / sum(n)) |>
+  ungroup() |>
+  ggplot(aes(share, fct_reorder(emotion, share), fill = review_label)) +
+  geom_col(position = "dodge") +
+  scale_x_continuous(labels = percent) +
+  scale_fill_manual(values = c(negative = "#d1495b", positive = "#00798c")) +
+  labs(title = "NRC emotion profile of positive vs negative reviews",
+       x = "Share of emotion words", y = NULL, fill = "True label")
+```
+
+## Sentiment by topic
+
+The three lexicon scores have different scales, so each is standardised
+(z-score) before being averaged per topic. The share of truly positive reviews
+in each topic is shown alongside as ground truth.
+
+```{r topic-sentiment}
+topic_sentiment <- scored |>
+  mutate(across(c(afinn, bing, nrc), \(x) as.numeric(scale(x)), .names = "{.col}_z")) |>
+  group_by(topic_label) |>
+  summarise(reviews        = n(),
+            pct_positive   = mean(sentiment == "positive"),
+            mean_stars     = mean(rating),
+            AFINN          = mean(afinn_z),
+            Bing           = mean(bing_z),
+            NRC            = mean(nrc_z)) |>
+  arrange(desc(AFINN))
+
+topic_sentiment |>
+  mutate(pct_positive = percent(pct_positive, accuracy = 0.1),
+         across(c(mean_stars, AFINN, Bing, NRC), \(x) round(x, 2)))
+```
+
+```{r topic-sentiment-plot, fig.height = 5.5}
+topic_sentiment |>
+  pivot_longer(c(AFINN, Bing, NRC), names_to = "lexicon", values_to = "z") |>
+  mutate(topic_label = fct_reorder(topic_label, z, .fun = mean)) |>
+  ggplot(aes(z, topic_label, colour = lexicon)) +
+  geom_vline(xintercept = 0, colour = "grey60") +
+  geom_point(size = 3.5, alpha = 0.9) +
+  scale_colour_manual(values = c(AFINN = "#30638e", Bing = "#edae49", NRC = "#d1495b")) +
+  labs(title = "Topic versus sentiment",
+       subtitle = "Mean standardised sentiment score of the reviews in each topic (right = more positive)",
+       x = "Mean sentiment (z-score)", y = NULL, colour = "Lexicon")
+```
+
+```{r topic-truth-plot, fig.height = 5}
+topic_sentiment |>
+  mutate(topic_label = fct_reorder(topic_label, pct_positive)) |>
+  ggplot(aes(pct_positive, topic_label, fill = pct_positive)) +
+  geom_col(show.legend = FALSE) +
+  geom_vline(xintercept = 0.5, linetype = "dashed") +
+  geom_text(aes(label = percent(pct_positive, accuracy = 1)), hjust = -0.15, size = 3.5) +
+  scale_fill_gradient2(low = "#d1495b", mid = "grey85", high = "#00798c", midpoint = 0.5) +
+  scale_x_continuous(labels = percent, limits = c(0, 1)) +
+  labs(title = "Which themes are praised and which are criticised?",
+       subtitle = "Share of reviews in each topic that are truly positive (dataset labels)",
+       x = "Positive reviews", y = NULL)
+```
+
+```{r topic-emotion-heatmap, fig.height = 5}
+scored |>
+  select(id, topic_label) |>
+  left_join(nrc_emotions, by = "id") |>
+  mutate(across(-c(id, topic_label), \(x) coalesce(x, 0L))) |>
+  pivot_longer(-c(id, topic_label), names_to = "emotion", values_to = "n") |>
+  group_by(topic_label, emotion) |>
+  summarise(n = sum(n), .groups = "drop_last") |>
+  mutate(share = n / sum(n)) |>
+  ungroup() |>
+  ggplot(aes(emotion, topic_label, fill = share)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = percent(share, accuracy = 1)), size = 3) +
+  scale_fill_gradient(low = "#f7f7f7", high = "#30638e", labels = percent) +
+  labs(title = "NRC emotion mix within each topic",
+       x = NULL, y = NULL, fill = "Share")
+```
+
+# Stage 6 – Validation against the dataset labels
+
+A review is predicted **positive** when its lexicon score is above 0 and
+**negative** otherwise.
+
+```{r validate}
+truth <- factor(scored$sentiment, levels = c("negative", "positive"))
+predict_label <- function(score) factor(ifelse(score > 0, "positive", "negative"),
+                                        levels = c("negative", "positive"))
+
+cms <- list(
+  AFINN = confusionMatrix(predict_label(scored$afinn), truth, positive = "positive"),
+  Bing  = confusionMatrix(predict_label(scored$bing),  truth, positive = "positive"),
+  NRC   = confusionMatrix(predict_label(scored$nrc),   truth, positive = "positive")
+)
+
+lexicon_accuracy <- tibble(
+  method      = names(cms),
+  accuracy    = sapply(cms, \(cm) cm$overall["Accuracy"]),
+  sensitivity = sapply(cms, \(cm) cm$byClass["Sensitivity"]),
+  specificity = sapply(cms, \(cm) cm$byClass["Specificity"]),
+  kappa       = sapply(cms, \(cm) cm$overall["Kappa"]),
+  zero_score  = c(mean(scored$afinn == 0), mean(scored$bing == 0), mean(scored$nrc == 0))
+)
+
+lexicon_accuracy |> mutate(across(-method, \(x) round(x, 3)))
+```
+
+Sensitivity is recall on positive reviews; specificity is recall on negative
+reviews. AFINN and NRC lean strongly positive (high sensitivity, low
+specificity): negative reviews still use many positive words ("good actors,
+*but*…"). Bing is the most balanced of the three, partly because it counts
+words such as *plot* and *funny* as negative.
+
+```{r confusion-plot, fig.height = 4}
+lapply(names(cms), function(m) {
+  as_tibble(cms[[m]]$table) |> mutate(method = m)
+}) |>
+  bind_rows() |>
+  group_by(method, Reference) |>
+  mutate(pct = n / sum(n)) |>
+  ungroup() |>
+  ggplot(aes(Reference, Prediction, fill = pct)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = paste0(comma(n), "\n(", percent(pct, accuracy = 1), ")")), size = 3.5) +
+  scale_fill_gradient(low = "#f7f7f7", high = "#30638e", guide = "none") +
+  facet_wrap(~ method) +
+  labs(title = "Confusion matrices of the lexicon methods",
+       subtitle = "Percentages are of each true class",
+       x = "True label", y = "Predicted label")
+```
+
+## Improvement 1: simple negation handling
+
+Dictionary methods miss negation (*not good*). A small fix: flip the AFINN
+score of a word when one of the two preceding words is a negator.
+
+```{r negation}
+negators <- c("not", "no", "never", "without", "nothing", "isn't", "wasn't",
+              "aren't", "don't", "doesn't", "didn't", "can't", "couldn't",
+              "won't", "wouldn't", "hardly", "nor", "neither")
+
+afinn_neg <- words_only |>
+  group_by(id) |>
+  mutate(prev1 = lag(word, 1), prev2 = lag(word, 2)) |>
+  ungroup() |>
+  inner_join(afinn, by = "word") |>
+  mutate(negated = coalesce(prev1 %in% negators | prev2 %in% negators, FALSE),
+         value   = if_else(negated, -value, value)) |>
+  group_by(id) |>
+  summarise(afinn_negation = sum(value), negated_words = sum(negated))
+
+scored <- scored |>
+  left_join(afinn_neg, by = "id") |>
+  mutate(afinn_negation = coalesce(afinn_negation, 0))
+
+cm_neg <- confusionMatrix(predict_label(scored$afinn_negation), truth, positive = "positive")
+
+words_only |>
+  group_by(id) |> mutate(prev1 = lag(word)) |> ungroup() |>
+  filter(prev1 %in% negators) |>
+  inner_join(afinn, by = "word") |>
+  count(phrase = paste(prev1, word), value, sort = TRUE) |>
+  slice_head(n = 10)
+
+tibble(method = c("AFINN", "AFINN + negation"),
+       accuracy = c(cms$AFINN$overall["Accuracy"], cm_neg$overall["Accuracy"])) |>
+  mutate(accuracy = round(accuracy, 3))
+```
+
+## Improvement 2: a supervised classifier (logistic regression)
+
+The lexicons use no training data. For comparison, a lasso-regularised
+logistic regression is trained on the same tf-idf document-term matrix
+(80 % train / 20 % test, split stratified by label).
+
+```{r logreg}
+y <- factor(reviews$sentiment, levels = c("negative", "positive"))
+train_idx <- createDataPartition(y, p = 0.8, list = FALSE)[, 1]
+
+cv_fit <- cv.glmnet(dtm[train_idx, ], y[train_idx], family = "binomial",
+                    alpha = 1, type.measure = "class", nfolds = 5)
+
+test_prob <- predict(cv_fit, dtm[-train_idx, ], s = "lambda.min", type = "response")[, 1]
+test_pred <- factor(ifelse(test_prob > 0.5, "positive", "negative"),
+                    levels = c("negative", "positive"))
+cm_glm <- confusionMatrix(test_pred, y[-train_idx], positive = "positive")
+cm_glm
+```
+
+```{r logreg-coefs, fig.height = 6}
+coefs <- coef(cv_fit, s = "lambda.min")
+coef_tbl <- tibble(term = rownames(coefs), weight = as.numeric(coefs)) |>
+  filter(term != "(Intercept)", weight != 0)
+
+cat("Terms kept by the lasso:", nrow(coef_tbl), "of", length(vocab), "\n")
+
+bind_rows(slice_max(coef_tbl, weight, n = 15), slice_min(coef_tbl, weight, n = 15)) |>
+  mutate(direction = if_else(weight > 0, "pushes towards positive", "pushes towards negative")) |>
+  ggplot(aes(weight, fct_reorder(term, weight), fill = direction)) +
+  geom_col() +
+  scale_fill_manual(values = c("pushes towards negative" = "#d1495b",
+                               "pushes towards positive" = "#00798c")) +
+  labs(title = "Strongest words in the logistic regression",
+       x = "Coefficient", y = NULL, fill = NULL)
+```
+
+```{r all-accuracy, fig.height = 4}
+accuracy_summary <- tibble(
+  method   = c("AFINN", "Bing", "NRC", "AFINN + negation", "Logistic regression (test set)"),
+  type     = c(rep("Lexicon (no training)", 4), "Supervised"),
+  accuracy = c(cms$AFINN$overall["Accuracy"], cms$Bing$overall["Accuracy"],
+               cms$NRC$overall["Accuracy"],   cm_neg$overall["Accuracy"],
+               cm_glm$overall["Accuracy"]),
+  lower_95 = c(cms$AFINN$overall["AccuracyLower"], cms$Bing$overall["AccuracyLower"],
+               cms$NRC$overall["AccuracyLower"],   cm_neg$overall["AccuracyLower"],
+               cm_glm$overall["AccuracyLower"]),
+  upper_95 = c(cms$AFINN$overall["AccuracyUpper"], cms$Bing$overall["AccuracyUpper"],
+               cms$NRC$overall["AccuracyUpper"],   cm_neg$overall["AccuracyUpper"],
+               cm_glm$overall["AccuracyUpper"])
+)
+
+ggplot(accuracy_summary, aes(accuracy, fct_reorder(method, accuracy), colour = type)) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", colour = "grey60") +
+  geom_errorbarh(aes(xmin = lower_95, xmax = upper_95), height = 0.2) +
+  geom_point(size = 3.5) +
+  geom_text(aes(label = percent(accuracy, accuracy = 0.1)), vjust = -1, size = 3.5,
+            show.legend = FALSE) +
+  scale_x_continuous(labels = percent, limits = c(0.45, 1)) +
+  scale_colour_manual(values = c("Lexicon (no training)" = "#edae49", Supervised = "#30638e")) +
+  labs(title = "Sentiment accuracy against the IMDb labels",
+       subtitle = "With 95% confidence intervals; dashed line = chance (balanced classes)",
+       x = "Accuracy", y = NULL, colour = NULL)
+```
+
+## Explaining predictions with LIME
+
+LIME perturbs a review by removing words and fits a simple local model to see
+which words drove the classifier's decision for that particular review.
+
+```{r lime, fig.height = 10}
+lime_model <- structure(list(fit = cv_fit), class = "imdb_lasso")
+
+registerS3method("model_type", "imdb_lasso",
+                 function(x, ...) "classification", envir = asNamespace("lime"))
+registerS3method("predict_model", "imdb_lasso", function(x, newdata, type, ...) {
+  p <- predict(x$fit, text_to_dtm(newdata), s = "lambda.min", type = "response")[, 1]
+  data.frame(negative = 1 - p, positive = p)
+}, envir = asNamespace("lime"))
+
+test_reviews <- reviews[-train_idx, ] |>
+  mutate(prob = test_prob, review_text = str_replace_all(review, "<[^>]+>", " "))
+
+# one confident positive, one confident negative, one the model got wrong
+to_explain <- bind_rows(
+  test_reviews |> filter(sentiment == "positive", n_words < 150) |> slice_max(prob, n = 1),
+  test_reviews |> filter(sentiment == "negative", n_words < 150) |> slice_min(prob, n = 1),
+  test_reviews |> filter(n_words < 150,
+                         (sentiment == "positive") != (prob > 0.5)) |> slice(1)
+)
+
+explainer <- lime(reviews$review[train_idx], lime_model)
+explanation <- explain(to_explain$review_text, explainer, n_labels = 1,
+                       n_features = 8, n_permutations = 1000)
+
+plot_features(explanation, ncol = 1)
+
+to_explain |>
+  transmute(case = c("confident positive", "confident negative", "misclassified"),
+            true_label = sentiment, predicted_p_positive = round(prob, 3),
+            text = str_trunc(str_squish(review_text), 300))
+```
+
+# Save outputs
+
+```{r save}
+write_csv(topic_terms, "outputs/lsa_topic_terms.csv")
+write_csv(topic_sentiment, "outputs/topic_sentiment.csv")
+write_csv(accuracy_summary, "outputs/sentiment_accuracy.csv")
+write_csv(select(scored, id, sentiment, rating, topic, topic_label,
+                 afinn, afinn_negation, bing, nrc),
+          "outputs/review_scores.csv")
+list.files("outputs", recursive = TRUE)
+```
+
+# Summary of findings
+
+```{r summary, echo = FALSE}
+best_topic  <- topic_sentiment |> slice_max(pct_positive, n = 1)
+worst_topic <- topic_sentiment |> slice_min(pct_positive, n = 1)
+```
+
+* **Topics.** LSA with k = `r K_TOPICS` varimax-rotated dimensions recovers
+  interpretable themes (see the topic chart). The most praised theme is
+  **`r best_topic$topic_label`** (`r percent(best_topic$pct_positive, 1)` of its
+  reviews are positive); the most criticised is **`r worst_topic$topic_label`**
+  (`r percent(worst_topic$pct_positive, 1)` positive).
+* **Lexicon sentiment.** Accuracy against the labels: AFINN
+  `r percent(cms$AFINN$overall[["Accuracy"]], 0.1)`, Bing
+  `r percent(cms$Bing$overall[["Accuracy"]], 0.1)`, NRC
+  `r percent(cms$NRC$overall[["Accuracy"]], 0.1)`. AFINN and NRC over-predict
+  the positive class; Bing is the most balanced and the most accurate lexicon. Simple negation handling moves AFINN to
+  `r percent(cm_neg$overall[["Accuracy"]], 0.1)`.
+* **Supervised model.** Lasso logistic regression on the same tf-idf features
+  reaches `r percent(cm_glm$overall[["Accuracy"]], 0.1)` on held-out reviews,
+  showing how much a model trained on movie-review language gains over
+  general-purpose dictionaries.
+* **Limitations confirmed.** Words like *plot*, *funny*, *like* and *kill* are
+  mis-scored by lexicons in a movie context; LSA needs a rotation and manual
+  judgement of k to give readable topics; LDA, transformer sentiment models and
+  aspect-level sentiment remain the natural next steps.
+
+```{r session, echo = FALSE}
+cat("R", R.version$major, ".", R.version$minor, " | ", nrow(reviews),
+    " reviews analysed | seed 2026\n", sep = "")
+```
