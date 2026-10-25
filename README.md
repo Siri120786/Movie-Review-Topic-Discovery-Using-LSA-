@@ -2,6 +2,8 @@
 
 Star ratings tell us **whether** viewers liked a film, not **why**. This project reads IMDb movie reviews in R, discovers the hidden themes people write about with **Latent Semantic Analysis (LSA)**, measures how they feel about each theme with **sentiment analysis**, and shows which themes audiences praise and which they criticise. An interactive **Shiny dashboard** predicts the sentiment of any review, or the overall public opinion of a movie.
 
+**Live dashboard: [siri120786.shinyapps.io/movie-review-sentiment](https://siri120786.shinyapps.io/movie-review-sentiment/)** (free hosting; the first visit may take 20–30 seconds to wake up)
+
 ![Top terms for each LSA topic](outputs/figures/topic-terms-plot-1.png)
 
 ## Key results
@@ -44,6 +46,7 @@ Star ratings tell us **whether** viewers liked a film, not **why**. This project
 | `get_lexicons.R` | Downloads the AFINN and NRC lexicons into `lexicons/` |
 | `train_model.R` | Trains the dashboard model and saves `model/model_bundle.rds` |
 | `install_packages.R` | Installs every R package the project needs |
+| `deploy.R` | Publishes the dashboard to shinyapps.io |
 | `outputs/` | Figures (`outputs/figures/`) and result tables (CSV) from the report |
 | `docs/Figure_Guide.docx` | A guide explaining what each figure shows and means |
 | `Movie_Review_LSA_Sentiment_Report.docx` | The written project report |

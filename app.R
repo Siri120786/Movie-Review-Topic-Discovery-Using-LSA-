@@ -94,6 +94,7 @@ ui <- page_navbar(
       tags$link(rel = "stylesheet",
                 href = "https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800;900&family=Playfair+Display:ital,wght@0,600;1,600&display=swap")
     ),
+    tags$style(HTML(".shiny-plot-output img{max-width:100%;height:auto!important}")),
     landing_ui(bundle)   # full-screen intro + topic carousel (R/landing.R)
   ),
 
@@ -125,9 +126,9 @@ ui <- page_navbar(
     layout_columns(
       col_widths = c(7, 5),
       card(card_header("Why? The words and phrases that drove the prediction"),
-           plotOutput("why_plot", height = 380)),
+           plotOutput("why_plot", height = "auto")),
       card(card_header("What is it about? LSA topic scores"),
-           plotOutput("topic_plot", height = 380))
+           plotOutput("topic_plot", height = "auto"))
     ),
     card(card_header("Comparison with the sentiment lexicons"),
          tableOutput("lexicon_table"))
@@ -159,8 +160,8 @@ ui <- page_navbar(
       uiOutput("movie_boxes"),
       layout_columns(
         col_widths = c(6, 6),
-        card(card_header("How positive is each review?"), plotOutput("movie_dist", height = 320)),
-        card(card_header("What are viewers talking about?"), plotOutput("movie_topics", height = 320))
+        card(card_header("How positive is each review?"), plotOutput("movie_dist", height = "auto")),
+        card(card_header("What are viewers talking about?"), plotOutput("movie_topics", height = "auto"))
       ),
       card(card_header("The most typical public review"),
            p(class = "small text-muted",
@@ -179,13 +180,13 @@ ui <- page_navbar(
     uiOutput("perf_boxes"),
     layout_columns(
       col_widths = c(6, 6),
-      card(card_header("Accuracy on 25,000 unseen test reviews"), plotOutput("acc_plot", height = 320)),
+      card(card_header("Accuracy on 25,000 unseen test reviews"), plotOutput("acc_plot", height = "auto")),
       card(card_header("Predicted vs actual public opinion per movie"),
-           plotOutput("movie_scatter", height = 320))
+           plotOutput("movie_scatter", height = "auto"))
     ),
     layout_columns(
       col_widths = c(7, 5),
-      card(card_header("Strongest words and phrases in the model"), plotOutput("coef_plot", height = 520)),
+      card(card_header("Strongest words and phrases in the model"), plotOutput("coef_plot", height = "auto")),
       div(
         card(card_header("Confusion matrix (test set)"), tableOutput("confusion")),
         card(card_header("Topics: share of positive reviews (test set)"), tableOutput("topic_table"))
@@ -274,7 +275,7 @@ server <- function(input, output, session) {
       scale_fill_manual(values = c("towards positive" = col_pos, "towards negative" = col_neg)) +
       labs(x = "Contribution to the prediction", y = NULL, fill = NULL) +
       theme(legend.position = "top")
-  })
+  }, width = 760, height = 380, res = 96)
 
   output$topic_plot <- renderPlot({
     s <- res()$topics
@@ -282,7 +283,7 @@ server <- function(input, output, session) {
       ggplot(aes(score, reorder(topic, score))) +
       geom_col(fill = "#30638e") +
       labs(x = "Topic score", y = NULL)
-  })
+  }, width = 560, height = 380, res = 96)
 
   output$lexicon_table <- renderTable({
     r <- res()
@@ -349,7 +350,7 @@ server <- function(input, output, session) {
       labs(x = "Predicted probability positive", y = "Reviews",
            fill = if (is.null(m$actual)) NULL else "Actual label") +
       theme(legend.position = if (is.null(m$actual)) "none" else "top")
-  })
+  }, width = 640, height = 320, res = 96)
 
   output$movie_topics <- renderPlot({
     m <- movie_data()
@@ -361,7 +362,7 @@ server <- function(input, output, session) {
       scale_fill_gradient2(low = col_neg, mid = "grey80", high = col_pos, midpoint = 0.5,
                            limits = c(0, 1), labels = percent) +
       labs(x = "Reviews", y = NULL, fill = "Predicted\npositive")
-  })
+  }, width = 640, height = 320, res = 96)
 
   review_card <- function(text, prob, topic) {
     tagList(
@@ -413,7 +414,7 @@ server <- function(input, output, session) {
       scale_fill_manual(values = c("Trained model" = "#30638e", Lexicon = "#edae49")) +
       labs(x = "Accuracy", y = NULL, fill = NULL) +
       theme(legend.position = "top")
-  })
+  }, width = 640, height = 320, res = 96)
 
   output$movie_scatter <- renderPlot({
     bundle$movies |>
@@ -423,7 +424,7 @@ server <- function(input, output, session) {
       scale_x_continuous(labels = percent) + scale_y_continuous(labels = percent) +
       scale_size_area(max_size = 4) +
       labs(x = "Actual % positive reviews", y = "Predicted % positive", size = "Reviews")
-  })
+  }, width = 640, height = 320, res = 96)
 
   output$coef_plot <- renderPlot({
     t <- bundle$top_terms
@@ -434,7 +435,7 @@ server <- function(input, output, session) {
       scale_fill_manual(values = c(positive = col_pos, negative = col_neg)) +
       labs(x = "Model weight", y = NULL, fill = NULL) +
       theme(legend.position = "top")
-  })
+  }, width = 760, height = 520, res = 96)
 
   output$confusion <- renderTable({
     cm <- bundle$confusion
@@ -449,6 +450,16 @@ server <- function(input, output, session) {
                 `Actual positive` = percent(actual_positive, accuracy = 1),
                 `Predicted positive` = percent(predicted_positive, accuracy = 1))
   }, striped = TRUE, width = "100%")
+
+  # Shiny 1.14's hidden-output tracking can miss bslib tab switches, leaving
+  # outputs on the movie and performance tabs suspended ("recalculating")
+  # forever. They are cheap to compute, so never suspend them.
+  for (id in c("review_boxes", "highlight", "why_plot", "topic_plot", "lexicon_table",
+               "movie_boxes", "movie_dist", "movie_topics", "typical_review",
+               "best_review", "worst_review", "perf_boxes", "acc_plot",
+               "movie_scatter", "coef_plot", "confusion", "topic_table")) {
+    outputOptions(output, id, suspendWhenHidden = FALSE)
+  }
 }
 
 shinyApp(ui, server)
